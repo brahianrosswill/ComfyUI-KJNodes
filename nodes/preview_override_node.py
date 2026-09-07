@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 import comfy.model_management
+import comfy.model_prefetch
 import comfy.patcher_extension
 import folder_paths
 import latent_preview
@@ -314,19 +315,24 @@ def _ltx_full_vae_decode_to_pil(vae, x0_5d, max_frames=None, stride=1):
     return [Image.fromarray(u8[i]) for i in range(u8.shape[0])]
 
 
-def _tiny_vae_decode_to_pil(decoder, x0, max_frames=None, stride=1):
+def _tiny_vae_decode_to_pil(decoder, x0, max_frames=None, stride=1, compile_preview=False):
     # Raises on failure so the caller can disable the decoder instead of retrying every step.
+    if x0.ndim not in (4, 5):
+        return []
+    compile_preview = compile_preview and comfy.model_prefetch.malloc_graph_enabled(decoder.device)
+    if compile_preview:
+        comfy.model_prefetch.malloc_graph_begin(decoder.device)
     if x0.ndim == 4:
         rgb = decoder.decode(x0[:1])[0].movedim(0, -1).unsqueeze(0).contiguous()
-    elif x0.ndim == 5:
+    else:
         indices = list(range(0, x0.shape[2], max(1, stride)))
         if max_frames is not None and 0 < max_frames < len(indices):
             picks = np.linspace(0, len(indices) - 1, max_frames).round().astype(int).tolist()
             indices = [indices[i] for i in picks]
         rgb = decoder.decode_video(x0[:1], frame_indices=indices)
-    else:
-        return []
     u8 = rgb.clamp(0, 1).mul(255).to(torch.uint8).cpu().numpy()
+    del rgb
+    comfy.model_prefetch.malloc_graph_end()
     return [Image.fromarray(u8[i]) for i in range(u8.shape[0])]
 
 
@@ -385,7 +391,9 @@ class _PreviewOverrideWrapper:
         guider = executor.class_obj
         model_patcher = guider.model_patcher
 
-        is_ltx = _is_ltx_latent_format(model_patcher.model.latent_format)
+        latent_format = model_patcher.model.latent_format
+        compile_preview = getattr(latent_format, "compile_preview", False)
+        is_ltx = _is_ltx_latent_format(latent_format)
         is_ltx2 = is_ltx and _is_ltx2_diffusion_model(model_patcher)
         num_keyframes = _ltx_num_keyframes(guider) if is_ltx else 0
 
@@ -493,7 +501,9 @@ class _PreviewOverrideWrapper:
                 init_latent = _normalize_packed_x0(init_latent, latent_shapes, num_keyframes)
                 pil_init = None
                 if tiny_vae is not None:
-                    pil_frames = _tiny_vae_decode_to_pil(tiny_vae, init_latent, max_frames=1)
+                    pil_frames = _tiny_vae_decode_to_pil(
+                        tiny_vae, init_latent, max_frames=1, compile_preview=compile_preview
+                    )
                     pil_init = pil_frames[0] if pil_frames else None
                 elif ltx_previewer is not None and init_latent.ndim == 5:
                     pil_frames = _ltx_decode_to_pil(ltx_previewer, init_latent, max_frames=1)
@@ -539,7 +549,9 @@ class _PreviewOverrideWrapper:
                     max_pil = anim_frames if animate_video else 1
                     if tiny_vae is not None:
                         try:
-                            pil_frames = _tiny_vae_decode_to_pil(tiny_vae, x0_view, max_frames=max_pil)
+                            pil_frames = _tiny_vae_decode_to_pil(
+                                tiny_vae, x0_view, max_frames=max_pil, compile_preview=compile_preview
+                            )
                         except Exception as e:
                             # OOM at 16x upscale is the likely cause — drop to the cheap paths for good.
                             logging.warning(f"[KJ PreviewOverride] tiny VAE decode failed, falling back: {e}")
