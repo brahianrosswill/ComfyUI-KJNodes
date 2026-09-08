@@ -9,8 +9,11 @@ import numpy as np
 import torch
 
 import comfy.model_management
-import comfy.model_prefetch
 import comfy.patcher_extension
+try:
+    import comfy.model_prefetch
+except Exception:
+    comfy.model_prefetch = None
 import folder_paths
 import latent_preview
 from comfy_api.latest import io
@@ -110,11 +113,10 @@ def _decode_video_frames_l2rgb(x0, latent_format, max_frames, stride=1):
         return []
 
 
-# PyPI PyAV wheels typically lack NVENC; probe once at import.
-def _probe_nvenc():
+def _probe_codec(name):
     try:
         import av  # noqa
-        av.Codec("h264_nvenc", "w")
+        av.Codec(name, "w")
         return True
     except Exception:
         return False
@@ -127,61 +129,69 @@ def _csp_blocks_video():
     except Exception:
         return False
 
-_HAS_NVENC = _probe_nvenc()
-_NVENC_AVAILABLE = _HAS_NVENC and not _csp_blocks_video()
-if _HAS_NVENC and not _NVENC_AVAILABLE:
+# CPU x264 first: at ultrafast it encodes a preview clip in ~0.1s and needs no CUDA context, while
+# NVENC's ffmpeg wrapper time-slices against the saturated sampling context and takes seconds per step.
+# The candidates are (codec, options, min_w, min_h); NVENC rejects sub-145x49 inputs at avcodec_open2.
+_MP4_CANDIDATES = [c for c in (
+    ("libx264", {"preset": "ultrafast", "tune": "zerolatency", "crf": "28"}, 2, 2),
+    ("h264_nvenc", {"preset": "p1", "rc": "vbr", "cq": "23"}, 145, 49),
+    ("h264_nvenc", {"preset": "p1"}, 145, 49),
+) if _probe_codec(c[0])]
+_HAS_MP4 = bool(_MP4_CANDIDATES)
+_MP4_AVAILABLE = _HAS_MP4 and not _csp_blocks_video()
+if _HAS_MP4 and not _MP4_AVAILABLE:
     logging.info("[KJ PreviewOverride] --disable-api-nodes blocks blob: video, using WebP for animated previews.")
 
-# NVENC H.264 rejects sub-145×49 inputs at avcodec_open2 — fall back to WebP for small frames.
-_NVENC_MIN_W = 145
-_NVENC_MIN_H = 49
-
-_nvenc_warned = False
+_mp4_warned = False
 
 
-def _encode_mp4_nvenc(frames, fps, max_res):
-    # Fragmented MP4 so the browser can decode mid-download. Returns (None, 0, 0) on failure
-    # (including too-small-for-NVENC), so caller falls through to WebP.
-    global _nvenc_warned
+def _encode_mp4(frames, fps, max_res):
+    # Fragmented MP4 so the browser can decode mid-download. Returns (None, 0, 0) when every
+    # candidate fails (including too-small frames), so caller falls through to WebP.
+    global _mp4_warned
     if not frames:
         return None, 0, 0
     try:
         import av
     except Exception:
         return None, 0, 0
+    # arrays arrive already at the preview size from _frames_to_arrays and go straight into the
+    # encoder plane; PIL frames from the other previewers are resized here
     pil_frames = []
     for f in frames:
+        if isinstance(f, np.ndarray):
+            pil_frames.append(f)
+            continue
         pf = f if f.mode == "RGB" else f.convert("RGB")
         if max_res and max_res > 0 and (pf.width > max_res or pf.height > max_res):
             pf = ImageOps.contain(pf, (max_res, max_res), Image.LANCZOS)
         pil_frames.append(pf)
     # yuv420p requires even dimensions.
-    w0, h0 = pil_frames[0].width, pil_frames[0].height
+    f0 = pil_frames[0]
+    w0, h0 = (f0.shape[1], f0.shape[0]) if isinstance(f0, np.ndarray) else (f0.width, f0.height)
     out_w, out_h = w0 & ~1, h0 & ~1
     if (out_w, out_h) != (w0, h0):
-        pil_frames = [pf.resize((out_w, out_h), Image.LANCZOS) for pf in pil_frames]
-    if out_w < _NVENC_MIN_W or out_h < _NVENC_MIN_H:
-        return None, 0, 0
-    # Driver/GPU varies what option combos are accepted; bare preset always works.
-    option_candidates = [
-        {"preset": "p1", "rc": "vbr", "cq": "23"},
-        {"preset": "p1"},
-    ]
+        pil_frames = [pf[:out_h, :out_w] if isinstance(pf, np.ndarray) else pf.resize((out_w, out_h), Image.LANCZOS)
+                      for pf in pil_frames]
     last_err = None
-    for opts in option_candidates:
+    for codec, opts, min_w, min_h in _MP4_CANDIDATES:
+        if out_w < min_w or out_h < min_h:
+            continue
         buf = pyio.BytesIO()
         try:
             container = av.open(
                 buf, mode="w", format="mp4",
                 options={"movflags": "frag_keyframe+empty_moov+default_base_moof"},
             )
-            stream = container.add_stream("h264_nvenc", rate=int(max(1, fps)))
+            stream = container.add_stream(codec, rate=int(max(1, fps)))
             stream.width = out_w
             stream.height = out_h
             stream.pix_fmt = "yuv420p"
             stream.options = opts
             for pf in pil_frames:
-                for pkt in stream.encode(av.VideoFrame.from_image(pf)):
+                vf = av.VideoFrame.from_ndarray(np.ascontiguousarray(pf), format="rgb24") if isinstance(pf, np.ndarray) \
+                    else av.VideoFrame.from_image(pf)
+                for pkt in stream.encode(vf):
                     container.mux(pkt)
             for pkt in stream.encode():
                 container.mux(pkt)
@@ -190,9 +200,9 @@ def _encode_mp4_nvenc(frames, fps, max_res):
         except Exception as e:
             last_err = e
             continue
-    if not _nvenc_warned:
-        _nvenc_warned = True
-        logging.warning(f"[KJ PreviewOverride] NVENC MP4 encode failed, using WebP fallback: {last_err}")
+    if not _mp4_warned and last_err is not None:
+        _mp4_warned = True
+        logging.warning(f"[KJ PreviewOverride] MP4 encode failed, using WebP fallback: {last_err}")
     return None, 0, 0
 
 
@@ -201,7 +211,7 @@ def _encode_animated_webp(frames, fps, quality, max_res):
         return None, 0, 0
     pil_frames = []
     for f in frames:
-        pf = f
+        pf = _as_pil(f)
         if pf.mode != "RGB":
             pf = pf.convert("RGB")
         if max_res and max_res > 0 and (pf.width > max_res or pf.height > max_res):
@@ -315,25 +325,92 @@ def _ltx_full_vae_decode_to_pil(vae, x0_5d, max_frames=None, stride=1):
     return [Image.fromarray(u8[i]) for i in range(u8.shape[0])]
 
 
-def _tiny_vae_decode_to_pil(decoder, x0, max_frames=None, stride=1, compile_preview=False):
-    # Raises on failure so the caller can disable the decoder instead of retrying every step.
-    if x0.ndim not in (4, 5):
-        return []
-    compile_preview = compile_preview and comfy.model_prefetch.malloc_graph_enabled(decoder.device)
-    if compile_preview:
-        comfy.model_prefetch.malloc_graph_begin(decoder.device)
-    if x0.ndim == 4:
-        rgb = decoder.decode(x0[:1])[0].movedim(0, -1).unsqueeze(0).contiguous()
+def _frame_to_pil(frame):
+    # [3, H, W] on any device, float in [0, 1] or uint8. Copies before the in-place math so a view into
+    # a shared batch is never scaled twice; fp16 elementwise on the CPU is slow, so it goes through fp32
+    if frame.dtype != torch.uint8:
+        frame = frame.to(torch.float32, copy=True).clamp_(0, 1).mul_(255).to(torch.uint8)
+    return Image.fromarray(frame.movedim(0, -1).contiguous().cpu().numpy())
+
+
+def _contain_size(w, h, max_res):
+    # ImageOps.contain sizing, rounded down to even so the yuv420p encode never needs a second resize;
+    # frames that already fit stay at native size
+    if not max_res or max_res <= 0 or (w <= max_res and h <= max_res):
+        return w, h
+    if w >= h:
+        tw, th = max_res, round(h / w * max_res)
     else:
-        indices = list(range(0, x0.shape[2], max(1, stride)))
-        if max_frames is not None and 0 < max_frames < len(indices):
-            picks = np.linspace(0, len(indices) - 1, max_frames).round().astype(int).tolist()
-            indices = [indices[i] for i in picks]
-        rgb = decoder.decode_video(x0[:1], frame_indices=indices)
-    u8 = rgb.clamp(0, 1).mul(255).to(torch.uint8).cpu().numpy()
-    del rgb
-    comfy.model_prefetch.malloc_graph_end()
-    return [Image.fromarray(u8[i]) for i in range(u8.shape[0])]
+        tw, th = round(w / h * max_res), max_res
+    return max(2, tw & ~1), max(2, th & ~1)
+
+
+def _frames_to_arrays(frames, max_res, budget_bytes=256 << 20):
+    # [T, 3, H, W] on the CPU -> [H, W, 3] uint8 arrays at the preview size. One antialiased tensor
+    # resize per chunk replaces a LANCZOS pass per frame in PIL, which dominated the preview latency
+    # on long clips; the chunk follows a byte budget so peak RAM stays flat across resolutions
+    h, w = frames.shape[-2:]
+    tw, th = _contain_size(w, h, max_res)
+    resize = (tw, th) != (w, h)
+    chunk = max(1, budget_bytes // (3 * h * w * 4))
+    out = []
+    for i in range(0, frames.shape[0], chunk):
+        x = frames[i:i + chunk]
+        if x.dtype != torch.uint8 or resize:
+            # copy: the batch may be an inference tensor from the sampler thread, in-place would raise
+            x = x.to(torch.float32, copy=True)
+            if frames.dtype == torch.uint8:
+                x.div_(255)
+            if resize:
+                x = torch.nn.functional.interpolate(x, size=(th, tw), mode="bilinear", antialias=True, align_corners=False)
+            x = x.clamp_(0, 1).mul_(255).to(torch.uint8)
+        u8 = x.permute(0, 2, 3, 1).contiguous().numpy()
+        out.extend(u8[j] for j in range(u8.shape[0]))
+    return out
+
+
+def _tiny_vae_decode_frames(decoder, x0, max_frames=None, compile_preview=False):
+    # Raises on failure so the caller can disable the decoder instead of retrying every step.
+    # Returns the whole [T, 3, H, W] clip on the CPU (uint8 from the 2D decoder, model dtype from
+    # TAEHV) or None. The compiler treats GPU allocations it did not plan as rogue and pays for them
+    # every step, so the decode joins the sampler thread's allocation graph and every GPU tensor is
+    # gone before the scope closes. Needs a core with per-thread graphs; older cores skip it.
+    if x0.ndim not in (4, 5):
+        return None
+    compiled = compile_preview and comfy.model_prefetch is not None and comfy.model_prefetch.malloc_graph_enabled(x0.device)
+    if compiled:
+        comfy.model_prefetch.malloc_graph_begin(x0.device)
+    try:
+        if x0.ndim == 4:
+            frames = decoder.decode(x0[:1])
+        else:
+            indices = list(range(x0.shape[2]))
+            if max_frames is not None and 0 < max_frames < len(indices):
+                picks = np.linspace(0, len(indices) - 1, max_frames).round().astype(int).tolist()
+                indices = [indices[i] for i in picks]
+            frames = decoder.decode_video(x0[:1], frame_indices=indices)
+        frames = None if frames is None or frames.shape[0] == 0 else frames.cpu()
+    finally:
+        if compiled:
+            comfy.model_prefetch.malloc_graph_end()
+    return frames
+
+
+def _materialize_frames(frames, max_res=0):
+    # a tensor batch comes from the tiny VAE and is converted here on the encoder thread into
+    # [H, W, 3] uint8 arrays; the other previewers already hand over PIL
+    if isinstance(frames, torch.Tensor):
+        return _frames_to_arrays(frames, max_res)
+    return list(frames)
+
+
+def _as_pil(frame):
+    return frame if isinstance(frame, Image.Image) else Image.fromarray(frame)
+
+
+def _tiny_vae_decode_to_pil(decoder, x0, max_frames=None, compile_preview=False):
+    frames = _tiny_vae_decode_frames(decoder, x0, max_frames, compile_preview)
+    return [] if frames is None else [_as_pil(a) for a in _frames_to_arrays(frames, 0)]
 
 
 def _is_ltx_latent_format(latent_format):
@@ -391,9 +468,7 @@ class _PreviewOverrideWrapper:
         guider = executor.class_obj
         model_patcher = guider.model_patcher
 
-        latent_format = model_patcher.model.latent_format
-        compile_preview = getattr(latent_format, "compile_preview", False)
-        is_ltx = _is_ltx_latent_format(latent_format)
+        is_ltx = _is_ltx_latent_format(model_patcher.model.latent_format)
         is_ltx2 = is_ltx and _is_ltx2_diffusion_model(model_patcher)
         num_keyframes = _ltx_num_keyframes(guider) if is_ltx else 0
 
@@ -464,6 +539,7 @@ class _PreviewOverrideWrapper:
         # N+1 boundaries for N steps: keep them all so the step marker advances through each.
         sigmas_list = sigmas.detach().cpu().tolist() if sigmas is not None else []
         # Pre-seed so step 1 has a measurable Δ (model's first transformation from noise → x0).
+        compile_preview = getattr(model_patcher.model.latent_format, "compile_preview", False)
         initial_seed_cpu = None
         try:
             if sigmas is not None and len(sigmas) > 0:
@@ -501,9 +577,7 @@ class _PreviewOverrideWrapper:
                 init_latent = _normalize_packed_x0(init_latent, latent_shapes, num_keyframes)
                 pil_init = None
                 if tiny_vae is not None:
-                    pil_frames = _tiny_vae_decode_to_pil(
-                        tiny_vae, init_latent, max_frames=1, compile_preview=compile_preview
-                    )
+                    pil_frames = _tiny_vae_decode_to_pil(tiny_vae, init_latent, max_frames=1, compile_preview=compile_preview)
                     pil_init = pil_frames[0] if pil_frames else None
                 elif ltx_previewer is not None and init_latent.ndim == 5:
                     pil_frames = _ltx_decode_to_pil(ltx_previewer, init_latent, max_frames=1)
@@ -537,71 +611,79 @@ class _PreviewOverrideWrapper:
         anim_fps = self.preview_fps
 
 
-        def new_callback(step, x0, x, total_steps_):
+        def produce_frames(x0_view):
+            # a [T, 3, H, W] CPU tensor from the tiny VAE, else a PIL list from whichever previewer
+            # applies, else []
             nonlocal tiny_vae
+            max_pil = anim_frames if animate_video else 1
+            if tiny_vae is not None:
+                try:
+                    frames = _tiny_vae_decode_frames(tiny_vae, x0_view, max_frames=max_pil, compile_preview=compile_preview)
+                    if frames is not None:
+                        return frames
+                except Exception as e:
+                    # OOM at 16x upscale is the likely cause — drop to the cheap paths for good.
+                    logging.warning(f"[KJ PreviewOverride] tiny VAE decode failed, falling back: {e}")
+                    tiny_vae = None
+            pil_frames = []
+            if ltx_full_vae is not None and x0_view.ndim == 5:
+                pil_frames = _ltx_full_vae_decode_to_pil(ltx_full_vae, x0_view, max_frames=max_pil)
+            if not pil_frames and ltx_previewer is not None and x0_view.ndim == 5:
+                try:
+                    pil_frames = _ltx_decode_to_pil(ltx_previewer, x0_view, max_frames=max_pil)
+                except Exception as e:
+                    logging.warning(f"LTX preview decode failed: {e}")
+            if not pil_frames and animate_video and x0_view.ndim == 5 and ltx_previewer is None:
+                pil_frames = _decode_video_frames_l2rgb(
+                    x0_view, model_patcher.model.latent_format, anim_frames,
+                )
+
+            if not pil_frames:
+                for prev in (previewer, fallback_previewer):
+                    if prev is None:
+                        continue
+                    try:
+                        out = prev.decode_latent_to_preview(x0_view)
+                    except Exception as e:
+                        if prev is previewer:
+                            logging.warning(f"Active previewer raised, trying Latent2RGB fallback: {e}")
+                        continue
+                    if isinstance(out, Image.Image):
+                        pil_frames = [out]
+                        break
+                    elif prev is previewer:
+                        logging.warning(
+                            f"Preview override: {type(previewer).__name__} returned "
+                            f"{type(out).__name__} instead of PIL.Image — falling back to Latent2RGB."
+                        )
+            return pil_frames
+
+        def new_callback(step, x0, x, total_steps_):
             if previewer is not None or fallback_previewer is not None or ltx_previewer is not None or tiny_vae is not None:
                 try:
                     # NEVER rebind x0 — the sampler reuses the same tensor downstream
                     # (unpack_latents reshapes it). Preview mutations stay on x0_view.
                     x0_view = _normalize_packed_x0(x0, latent_shapes, num_keyframes)
+                    frames = produce_frames(x0_view)
 
-                    pil_frames = []
-                    max_pil = anim_frames if animate_video else 1
-                    if tiny_vae is not None:
-                        try:
-                            pil_frames = _tiny_vae_decode_to_pil(
-                                tiny_vae, x0_view, max_frames=max_pil, compile_preview=compile_preview
-                            )
-                        except Exception as e:
-                            # OOM at 16x upscale is the likely cause — drop to the cheap paths for good.
-                            logging.warning(f"[KJ PreviewOverride] tiny VAE decode failed, falling back: {e}")
-                            tiny_vae = None
-                    if not pil_frames and ltx_full_vae is not None and x0_view.ndim == 5:
-                        pil_frames = _ltx_full_vae_decode_to_pil(ltx_full_vae, x0_view, max_frames=max_pil)
-                    if not pil_frames and ltx_previewer is not None and x0_view.ndim == 5:
-                        try:
-                            pil_frames = _ltx_decode_to_pil(ltx_previewer, x0_view, max_frames=max_pil)
-                        except Exception as e:
-                            logging.warning(f"LTX preview decode failed: {e}")
-                    if not pil_frames and animate_video and x0_view.ndim == 5 and ltx_previewer is None:
-                        pil_frames = _decode_video_frames_l2rgb(
-                            x0_view, model_patcher.model.latent_format, anim_frames,
-                        )
-
-                    if not pil_frames:
-                        for prev in (previewer, fallback_previewer):
-                            if prev is None:
-                                continue
-                            try:
-                                out = prev.decode_latent_to_preview(x0_view)
-                            except Exception as e:
-                                if prev is previewer:
-                                    logging.warning(f"Active previewer raised, trying Latent2RGB fallback: {e}")
-                                continue
-                            if isinstance(out, Image.Image):
-                                pil_frames = [out]
-                                break
-                            elif prev is previewer:
-                                logging.warning(
-                                    f"Preview override: {type(previewer).__name__} returned "
-                                    f"{type(out).__name__} instead of PIL.Image — falling back to Latent2RGB."
-                                )
-
-                    if not pil_frames:
+                    if isinstance(frames, torch.Tensor):
+                        pil_first = _frame_to_pil(frames[0])
+                    elif frames:
+                        pil_first = frames[0]
+                        if pil_first.mode != "RGB":
+                            pil_first = pil_first.convert("RGB")
+                            frames[0] = pil_first
+                    else:
                         if original_callback is not None:
                             original_callback(step, x0, x, total_steps_)
                         return
-
-                    pil_first = pil_frames[0]
-                    if pil_first.mode != "RGB":
-                        pil_first = pil_first.convert("RGB")
-                        pil_frames[0] = pil_first
                     # Consumed by GetPreviewOverrideFramesKJ.
                     self.frames.append(pil_first)
 
                     if node_id is not None and PromptServer is not None:
-                        # x0_view (not x0) so LTX keyframe padding doesn't dampen the Δ norm.
-                        x0_cpu_now = x0_view.detach().float().cpu()
+                        # x0_view (not x0) so LTX keyframe padding doesn't dampen the Δ norm; copied
+                        # off the GPU before the float cast so nothing is allocated on the device
+                        x0_cpu_now = x0_view.detach().cpu().float()
                         prev_x0_cpu = state["last_x0_cpu"]
                         state["last_x0_cpu"] = x0_cpu_now
 
@@ -619,22 +701,23 @@ class _PreviewOverrideWrapper:
                         sent_step = step + 1
 
                         def _encode_and_send(
-                            pil_frames=pil_frames, x0_cpu_now=x0_cpu_now, prev_x0_cpu=prev_x0_cpu,
+                            frames=frames, x0_cpu_now=x0_cpu_now, prev_x0_cpu=prev_x0_cpu,
                             step_ms=step_ms, avg_step_ms=avg_step_ms, sigma_val=sigma_val,
                             sent_step=sent_step, total_steps_=total_steps_,
                         ):
-                            if len(pil_frames) > 1:
-                                # NVENC ~8x faster + ~5x smaller than PIL WebP when available.
+                            frames = _materialize_frames(frames, max_res)
+                            if len(frames) > 1:
+                                # MP4 is far faster and smaller than PIL WebP when an encoder is available.
                                 b64, w_, h_, mime = None, 0, 0, None
-                                if _NVENC_AVAILABLE:
-                                    b64, w_, h_ = _encode_mp4_nvenc(pil_frames, anim_fps, max_res)
+                                if _MP4_AVAILABLE:
+                                    b64, w_, h_ = _encode_mp4(frames, anim_fps, max_res)
                                     if b64:
                                         mime = "video/mp4"
                                 if not b64:
-                                    b64, w_, h_ = _encode_animated_webp(pil_frames, anim_fps, quality, max_res)
+                                    b64, w_, h_ = _encode_animated_webp(frames, anim_fps, quality, max_res)
                                     mime = "image/webp"
                             else:
-                                pil_send = pil_frames[0]
+                                pil_send = _as_pil(frames[0])
                                 if max_res and max_res > 0 and (pil_send.width > max_res or pil_send.height > max_res):
                                     pil_send = ImageOps.contain(pil_send, (max_res, max_res), Image.LANCZOS)
                                 buf = pyio.BytesIO()
@@ -699,6 +782,10 @@ class _PreviewOverrideWrapper:
             encoder.shutdown(drain_timeout=5.0)
             for cls, prev in prev_methods:
                 cls.decode_latent_to_preview_image = prev
+            if torch.cuda.is_available():
+                # the decode grows torch's pool and the pool keeps it; under dynamic VRAM that reservation
+                # displaces weight pages for every later prompt, so hand it back before returning
+                torch.cuda.empty_cache()
             if vae_restore_device is not None and self.vae is not None:
                 try:
                     self.vae.first_stage_model.to(vae_restore_device)
